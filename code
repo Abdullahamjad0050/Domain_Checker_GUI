@@ -1,0 +1,432 @@
+"""
+VirusTotal Domain Reputation Checker - Modern PyQt6 GUI
+Features:
+ - Progress bar
+ - Pause / Resume
+ - History folder with timestamped CSVs
+ - Summary statistics
+ - Dark theme, glowing buttons, color-coded log, pulsing status animation
+Requires: PyQt6, requests
+"""
+
+import sys
+import os
+import csv
+import time
+import threading
+import requests
+from datetime import datetime
+from PyQt6.QtWidgets import (
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout,
+    QPushButton, QLabel, QFileDialog, QProgressBar,
+    QTextEdit, QMessageBox, QSpinBox, QFrame
+)
+from PyQt6.QtCore import Qt, QTimer, QObject, pyqtSignal
+
+# ---------------- CONFIG ----------------
+API_KEY = "1f2ae8831abfa4af6aa514d2859ac51e959075a5661c5d1850e621e859de3857"  # Put your VirusTotal API key here (or paste into the code)
+BASE_URL = "https://www.virustotal.com/api/v3/domains"
+HEADERS = lambda key: {"x-apikey": key}
+
+# ---------------- SIGNALS OBJECT ----------------
+class WorkerSignals(QObject):
+    log = pyqtSignal(str, str)        # html_message, level
+    progress = pyqtSignal(int)        # percentage
+    status = pyqtSignal(str)          # status text
+    finished = pyqtSignal(dict)       # summary dict
+    error = pyqtSignal(str)           # error message
+
+# ---------------- WORKER ----------------
+class ScannerWorker:
+    def __init__(self, domains, api_key, delay_seconds, signals: WorkerSignals):
+        self.domains = domains
+        self.api_key = api_key
+        self.delay = delay_seconds
+        self.signals = signals
+
+        self._stop = False
+        self._pause = False
+        self._lock = threading.Lock()
+
+    def stop(self):
+        with self._lock:
+            self._stop = True
+
+    def pause(self, value: bool):
+        with self._lock:
+            self._pause = value
+
+    def paused(self):
+        with self._lock:
+            return self._pause
+
+    def should_stop(self):
+        with self._lock:
+            return self._stop
+
+    def run(self):
+        total = len(self.domains)
+        if total == 0:
+            self.signals.error.emit("No domains to scan.")
+            return
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        os.makedirs("history", exist_ok=True)
+        outpath = os.path.join("history", f"domain_reputation_{timestamp}.csv")
+
+        fieldnames = ["domain", "malicious", "suspicious", "harmless", "undetected"]
+        counts = {"malicious": 0, "suspicious": 0, "harmless": 0, "undetected": 0}
+
+        try:
+            with open(outpath, "w", newline="") as csvfile:
+                writer = csv.writer(csvfile)
+                writer.writerow(fieldnames)
+
+                for i, domain in enumerate(self.domains, start=1):
+                    if self.should_stop():
+                        self.signals.log.emit(f"<i>⏹ Scan stopped by user at {i}/{total}.</i>", "warn")
+                        break
+
+                    # Pause handling
+                    while self.paused() and not self.should_stop():
+                        self.signals.status.emit("Paused")
+                        time.sleep(0.3)
+                    if self.should_stop():
+                        self.signals.log.emit(f"<i>⏹ Scan stopped by user at {i}/{total}.</i>", "warn")
+                        break
+
+                    self.signals.status.emit(f"Checking {domain} ({i}/{total})")
+                    self.signals.log.emit(f"🔍 Checking <b>{domain}</b>...", "info")
+
+                    try:
+                        resp = requests.get(f"{BASE_URL}/{domain}", headers=HEADERS(self.api_key), timeout=30)
+                        if resp.status_code != 200:
+                            msg = f"API error {resp.status_code} for {domain}"
+                            self.signals.log.emit(f"❌ <b>{domain}</b> – {msg}", "error")
+                        else:
+                            data = resp.json()
+                            stats = data.get("data", {}).get("attributes", {}).get("last_analysis_stats", {})
+                            malicious = int(stats.get("malicious", 0))
+                            suspicious = int(stats.get("suspicious", 0))
+                            harmless = int(stats.get("harmless", 0))
+                            undetected = int(stats.get("undetected", 0))
+
+                            counts["malicious"] += malicious
+                            counts["suspicious"] += suspicious
+                            counts["harmless"] += harmless
+                            counts["undetected"] += undetected
+
+                            writer.writerow([domain, malicious, suspicious, harmless, undetected])
+
+                            # Color logic & log
+                            if malicious > 0:
+                                level = "bad"
+                                html = f'✅ <span style="color:#ff7b7b;"><b>{domain}</b></span> - Malicious: {malicious}, Suspicious: {suspicious}'
+                            elif suspicious > 0:
+                                level = "warn"
+                                html = f'⚠ <span style="color:#ffd580;"><b>{domain}</b></span> - Suspicious: {suspicious}'
+                            else:
+                                level = "good"
+                                html = f'✅ <span style="color:#85e085;"><b>{domain}</b></span> - Clean (Harmless: {harmless})'
+
+                            self.signals.log.emit(html, level)
+
+                    except Exception as e:
+                        self.signals.log.emit(f"❌ <b>{domain}</b> - Exception: {e}", "error")
+
+                    percent = int((i / total) * 100)
+                    self.signals.progress.emit(percent)
+                    time.sleep(self.delay)
+
+        except Exception as e:
+            self.signals.error.emit(f"Failed to write history or run scan: {e}")
+            return
+
+        # Final summary
+        summary = {
+            "total_domains": total,
+            "malicious": counts["malicious"],
+            "suspicious": counts["suspicious"],
+            "harmless": counts["harmless"],
+            "undetected": counts["undetected"],
+            "output_file": outpath
+        }
+        self.signals.finished.emit(summary)
+
+
+# ---------------- MAIN UI ----------------
+class VTWindow(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("VirusTotal — Futuristic Checker")
+        self.setMinimumSize(820, 560)
+        self.setWindowFlag(Qt.WindowType.WindowMinimizeButtonHint, True)
+
+        # UI state
+        self.domains = []
+        self.worker = None
+        self.worker_thread = None
+        self.signals = WorkerSignals()
+
+        # Build UI
+        self._build_ui()
+        self._connect_signals()
+        self._apply_dark_style()
+
+    def _build_ui(self):
+        main = QVBoxLayout()
+        main.setSpacing(12)
+        main.setContentsMargins(14, 14, 14, 14)
+        self.setLayout(main)
+
+        # Top row: Load file, Delay spinner, Buttons
+        top_row = QHBoxLayout()
+        top_row.setSpacing(8)
+
+        self.load_btn = QPushButton("Load Domains")
+        self.load_btn.setToolTip("Load a .txt file with one domain per line")
+        top_row.addWidget(self.load_btn)
+
+        top_row.addWidget(QLabel("Delay (s):"))
+        self.delay_spin = QSpinBox()
+        self.delay_spin.setRange(1, 300)
+        self.delay_spin.setValue(15)
+        top_row.addWidget(self.delay_spin)
+
+        self.start_btn = QPushButton("Start")
+        top_row.addWidget(self.start_btn)
+
+        self.pause_btn = QPushButton("Pause")
+        self.pause_btn.setEnabled(False)
+        top_row.addWidget(self.pause_btn)
+
+        self.stop_btn = QPushButton("Stop")
+        self.stop_btn.setEnabled(False)
+        top_row.addWidget(self.stop_btn)
+
+        # Spacer
+        top_row.addStretch()
+        main.addLayout(top_row)
+
+        # Status + pulse
+        status_row = QHBoxLayout()
+        self.status_label = QLabel("Idle — load a domain list to begin.")
+        status_row.addWidget(self.status_label)
+        status_row.addStretch()
+
+        # pulsing indicator
+        self.pulse = QLabel()
+        self.pulse.setFixedSize(14, 14)
+        self._pulse_state = 0
+        status_row.addWidget(self.pulse)
+        main.addLayout(status_row)
+
+        # Progress bar
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        self.progress.setTextVisible(True)
+        main.addWidget(self.progress)
+
+        # Separator
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setFrameShadow(QFrame.Shadow.Sunken)
+        main.addWidget(sep)
+
+        # Log (HTML)
+        self.log = QTextEdit()
+        self.log.setReadOnly(True)
+        self.log.setAcceptRichText(True)
+        self.log.setStyleSheet("QTextEdit { font-family: Consolas, monospace; font-size: 11px; }")
+        main.addWidget(self.log, stretch=1)
+
+        # Summary area at bottom
+        bottom_row = QHBoxLayout()
+        self.summary_label = QLabel("Summary will appear here after scan.")
+        bottom_row.addWidget(self.summary_label)
+        bottom_row.addStretch()
+        main.addLayout(bottom_row)
+
+    def _connect_signals(self):
+        self.load_btn.clicked.connect(self.load_domains)
+        self.start_btn.clicked.connect(self.start_scan)
+        self.pause_btn.clicked.connect(self.toggle_pause)
+        self.stop_btn.clicked.connect(self.stop_scan)
+
+        # Worker signals connections
+        self.signals.log.connect(self.append_log)
+        self.signals.progress.connect(self.update_progress)
+        self.signals.status.connect(self.update_status)
+        self.signals.finished.connect(self.scan_finished)
+        self.signals.error.connect(self.show_error)
+
+        # Pulse timer for small animation
+        self.pulse_timer = QTimer(self)
+        self.pulse_timer.setInterval(400)
+        self.pulse_timer.timeout.connect(self._animate_pulse)
+        self.pulse_timer.start()
+
+    def _apply_dark_style(self):
+        # Fusion + dark palette-like stylesheet + glowing buttons
+        self.setStyleSheet("""
+            QWidget { background: #0e1116; color: #d7e0ea; }
+            QLineEdit, QTextEdit { background:#0b0f14; color:#d7e0ea; border:1px solid #1f2a36; }
+            QPushButton {
+                background: qlineargradient(spread:pad, x1:0, y1:0, x2:1, y2:0, stop:0 #0f9dff, stop:1 #6b5bff);
+                color: white; padding:8px 12px; border-radius:8px; font-weight:600;
+            }
+            QPushButton:disabled { background: rgba(80,80,80,0.25); color: #888; }
+            QPushButton#start_btn { background: #00d27a; }
+            QPushButton#stop_btn { background: #ff5a6e; }
+            QPushButton:hover { box-shadow: 0 0 18px rgba(99, 136, 255, 0.25); }
+            QProgressBar {
+                background: #081018;
+                border: 1px solid #1d2630;
+                border-radius: 10px;
+                text-align: center;
+                height: 18px;
+            }
+            QProgressBar::chunk {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #00f2a7, stop:1 #00a3ff);
+                border-radius: 10px;
+            }
+            QLabel { font-weight: 500; }
+        """)
+        # Give IDs for special buttons (optional)
+        self.start_btn.setObjectName("start_btn")
+        self.stop_btn.setObjectName("stop_btn")
+
+        # Initial pulse style
+        self.pulse.setStyleSheet("background: rgba(100,255,200,0.18); border-radius: 7px;")
+
+    # ---------- UI actions ----------
+    def load_domains(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Open Domain List", "", "Text Files (*.txt);;All Files (*)")
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                self.domains = [line.strip() for line in f if line.strip()]
+            self.status_label.setText(f"Loaded {len(self.domains)} domains.")
+            self.append_log(f"<i>📂 Loaded {len(self.domains)} domains from <b>{os.path.basename(path)}</b></i>", "info")
+            self.progress.setValue(0)
+            self.summary_label.setText("Summary will appear here after scan.")
+        except Exception as e:
+            self.show_error(f"Failed to load file: {e}")
+
+    def start_scan(self):
+        if not self.domains:
+            QMessageBox.warning(self, "No domains", "Please load a domain file first.")
+            return
+        # disable/enable appropriate buttons
+        self.start_btn.setEnabled(False)
+        self.pause_btn.setEnabled(True)
+        self.stop_btn.setEnabled(True)
+        self.pause_btn.setText("Pause")
+
+        # create worker
+        delay = int(self.delay_spin.value())
+        api_key = API_KEY.strip()
+        if not api_key:
+            QMessageBox.warning(self, "API key missing", "Please set your API_KEY variable in the script or modify the UI to accept it.")
+            self.start_btn.setEnabled(True)
+            return
+
+        self.signals.log.emit("<i>🚀 Starting scan...</i>", "info")
+        self.worker = ScannerWorker(self.domains, api_key, delay, self.signals)
+
+        # start thread
+        self.worker_thread = threading.Thread(target=self.worker.run, daemon=True)
+        self.worker_thread.start()
+
+    def toggle_pause(self):
+        if not self.worker:
+            return
+        # flip state
+        is_paused = not self.worker.paused()
+        self.worker.pause(is_paused)
+        self.pause_btn.setText("Resume" if is_paused else "Pause")
+        self.append_log(f"<i>{'⏸ Paused' if is_paused else '▶ Resumed'}</i>", "info")
+
+    def stop_scan(self):
+        if self.worker:
+            self.worker.stop()
+        self.append_log("<i>⏹ Requested to stop scan...</i>", "warn")
+        # re-enable start button early so user can start another scan after stop
+        self.start_btn.setEnabled(True)
+        self.pause_btn.setEnabled(False)
+        self.pause_btn.setText("Pause")
+        self.stop_btn.setEnabled(False)
+
+    # ---------- Slots for worker signals ----------
+    def append_log(self, html_message: str, level: str):
+        # level may be: good, warn, bad, info, error
+        color_map = {
+            "good": "#7ef08f",
+            "warn": "#ffd580",
+            "bad": "#ff7b7b",
+            "info": "#9fd0ff",
+            "error": "#ff7b7b"
+        }
+        color = color_map.get(level, "#d7e0ea")
+        ts = datetime.now().strftime("%H:%M:%S")
+        wrapped = f'<div style="margin:3px 0;"><span style="color:#7c8a97; font-size:10px;">[{ts}]</span> ' \
+                  f'<span style="color:{color};">{html_message}</span></div>'
+        self.log.append(wrapped)
+
+    def update_progress(self, percent: int):
+        self.progress.setValue(percent)
+
+    def update_status(self, text: str):
+        self.status_label.setText(text)
+
+    def scan_finished(self, summary: dict):
+        # finalize UI
+        self.start_btn.setEnabled(True)
+        self.pause_btn.setEnabled(False)
+        self.stop_btn.setEnabled(False)
+        self.progress.setValue(100)
+        self.status_label.setText("Scan Finished ✅")
+
+        # summary text
+        s = (f"Scan finished: {summary['total_domains']} domains.\n"
+             f"Malicious detections total: {summary['malicious']}\n"
+             f"Suspicious detections total: {summary['suspicious']}\n"
+             f"Harmless total: {summary['harmless']}\n"
+             f"Undetected total: {summary['undetected']}\n"
+             f"Saved to: {summary['output_file']}")
+        self.summary_label.setText(s.replace("\n", "   |   "))
+        self.append_log("<b>=== Summary ===</b>", "info")
+        self.append_log(s.replace("\n", "<br>"), "info")
+
+    def show_error(self, message: str):
+        QMessageBox.critical(self, "Error", message)
+        self.append_log(f"❌ <b>Error</b>: {message}", "error")
+
+    # ---------- small pulse animation ----------
+    def _animate_pulse(self):
+        # make the pulse brightness cycle
+        self._pulse_state = (self._pulse_state + 1) % 6
+        alpha = 30 + self._pulse_state * 30
+        color = f"rgba(80,200,255,{alpha/255:.2f})"
+        self.pulse.setStyleSheet(f"background:{color}; border-radius:7px;")
+
+    def closeEvent(self, event):
+        # request stop for worker if running
+        if self.worker:
+            self.worker.stop()
+        event.accept()
+
+
+# ---------------- RUN APP ----------------
+def main():
+    app = QApplication(sys.argv)
+    # Attempt to set Fusion style for modern look
+    app.setStyle("Fusion")
+    win = VTWindow()
+    win.show()
+    sys.exit(app.exec())
+
+if __name__ == "__main__":
+    main()
